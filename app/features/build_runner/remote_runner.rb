@@ -1,12 +1,20 @@
-require "micromachine"
 require_relative "../../../agent/client"
-require_relative "../../shared/models/artifact"
+require_relative "../../../lib/notifications"
 
 module FastlaneCI
-  # RemoteRunner class
+  ##
+  # RemoteRunner
   #
+  # This class will connect to a running Agent (provided by the grpc parameter)
+  # and execute a fastlane command, streaming back the responses.
+  # It can also provide an interface for anyone to listen to updates from the GRPC service.
   class RemoteRunner
     include FastlaneCI::Logging
+
+    ##
+    # `history` keeps a record of all of the notifications that were published to subscribers during a run.
+    # this is used when a new subscriber `#subscribe`s to the Runner, they will be notified of all past messages.
+    attr_reader :history
 
     # Reference to the FastlaneCI::Project of this particular build run
     attr_reader :project
@@ -20,174 +28,160 @@ module FastlaneCI
     # The commit sha we want to run the build for
     attr_reader :sha
 
-    # All lines that were generated so far, this might not be a complete run
-    # This is an array of hashes
-    attr_accessor :all_build_output_log_rows
-
-    # TODO: Add comment
-    attr_accessor :build_change_observer_blocks
-
     # TODO: extract this thing out of this class.
     attr_reader :github_service
 
-    def initialize(project:, git_fork_config:, trigger:, github_service:)
+    # TODO(snatchev): consider how to reduce the number of dependencies to this class.
+    def initialize(project:, git_fork_config:, trigger:, github_service:, grpc: Agent::Client.new("localhost"))
       @project = project
       @git_fork_config = git_fork_config
-      @all_build_output_log_rows = []
-      @build_change_observer_blocks = []
       @github_service = github_service
-
       @current_build = prepare_build_object(trigger: trigger)
-      # This build needs to be saved during initialization because RemoteRunner.start
-      # is called by a TaskQueue and could potentially happen after the BuildController tries to
-      # fetch this build.
+      @grpc = grpc
+
+      @history = [] # TODO: consider implications if history becomes really large.
+      @complete = false
+      @completion_blocks = [] # TODO(snatchev): does this needs to be a threadsafe array?
+
+      # This build needs to be saved during initialization because
+      # RemoteRunner.start is called by a TaskQueue and could potentially
+      # happen after the BuildController tries to fetch this build.
       save_build_status_locally!
-
-      @artifacts_path = Dir.mktmpdir
-
-      fastlane_log_path = File.join(@artifacts_path, "fastlane.log")
-      @fastlane_log = Logger.new(fastlane_log_path)
-      @current_build.artifacts << Artifact.new(
-        type: "fastlane.log",
-        reference: fastlane_log_path,
-        provider: @project.artifact_provider
-      )
-
-      @build_state = MicroMachine.new(:PENDING).tap do |fsm|
-        fsm.when(:RUNNING,   PENDING:   :RUNNING)
-        fsm.when(:REJECTED,  PENDING:   :REJECTED)
-        fsm.when(:FINISHING, RUNNING:   :FINISHING)
-        fsm.when(:SUCCEEDED, FINISHING: :SUCCEEDED)
-        fsm.when(:FAILED,    RUNNING:   :FAILED)
-        fsm.when(:BROKEN,    PENDING:   :BROKEN,
-                             RUNNING:   :BROKEN,
-                             FINISHING: :BROKEN)
-      end
-    end
-
-    # Add a listener to get real time updates on new rows (see `new_row`)
-    # This is used for the socket connection to the user's browser
-    def add_build_change_listener(block)
-      @build_change_observer_blocks << block
     end
 
     def start
       env = environment_variables_for_worker
-
       start_time = Time.now.utc
 
-      responses = Agent::Client.new("localhost").request_run_fastlane(
-        "bundle", "exec", "fastlane", project.platform, project.lane, env: env
-      )
+      responses = @grpc.request_run_fastlane("bundle", "exec", "fastlane", project.platform, project.lane, env: env)
       responses.each do |response|
-        validate_agent_response(response: response)
-        process_agent_response(response: response)
-      end
-      emit_new_row(type: :last_message, message: nil, time: Time.now)
+        # update the build's duration every time we get a message from the runner.
+        current_build.duration = Time.now.utc - start_time
 
-      current_build.duration = Time.now.utc - start_time
-      if @build_state.state == :SUCCEEDED
+        # dispatch to handler methods
+        handle_log(response.log)           if response.log
+        handle_state(response.state)       if response.state
+        handle_error(response.error)       if response.error
+        handle_artifact(response.artifact) if response.artifact
+      end
+
+      @complete = true
+      @completion_blocks.each(&:call)
+    end
+
+    def completed?
+      @complete == true
+    end
+
+    def on_complete(&block)
+      @completion_blocks << block
+    end
+
+    ##
+    # This will get called on every iteration since `state` has a default value of :PENDING.
+    # Skip in that case.
+    def handle_state(state)
+      return if state == :PENDING
+
+      logger.debug("handle state transition: #{state}")
+      publish_to_all(state: state)
+
+      # TODO(snatchev): we should have the build state be the same as the InvocationResponse::State enum
+      case state
+      when :RUNNING
+        current_build.status = :running
+      when :FINISHING
+        current_build.status = :running
+      when :REJECTED
+        current_build.status = :ci_problem
+      when :FAILED
+        current_build.status = :failure
+      when :BROKEN
+        current_build.status = :failure
+      when :SUCCEEDED
         current_build.status = :success
         current_build.description = "All green"
-        logger.info("fastlane run complete")
       else
-        current_build.status = :failure
-      end
-
-      @current_build.artifacts.each do |artifact|
-        project.artifact_provider.store!(artifact: artifact, build: current_build, project: project)
+        logger.error("unknown state #{state}")
       end
 
       save_build_status!
-      Services.build_runner_service.remove_build_runner(build_runner: self)
-      return @build_state.state == :SUCCEEDED
     end
 
-    def validate_agent_response(response:)
-      if @build_state.state == :PENDING && !response.state
-        raise "First InvocationResponse should change the state from :PENDING"
-      end
-      if response.state != :PENDING
-        unless @build_state.trigger?(response.state)
-          raise "Unexpected state change #{@build_state.state} -> #{response.state}"
-        end
-      elsif @build_state.state == :RUNNING && !response.log
-        raise "Expecting InvocationResponses containing log lines while :RUNNING"
-      elsif (@build_state.state == :BROKEN || @build_state.state == :REJECTED) && !response.error
-        raise "Expecting InvocationResponses containing the error details after :BROKEN or :REJECTED"
-      elsif @build_state.state == :FINISHING && !response.artifact
-        raise "Expecting InvocationResponses containing artifacts while :FINISHING"
-      elsif @build_state.state == :SUCCEEDED || @build_state.state == :FAILED
-        raise "No further InvocationResponse messages expected after :SUCCEEDED or :FAILED"
-      end
+    def handle_log(log)
+      logger.debug("handle log: #{log.inspect}")
+      publish_to_all(log: log.to_h)
     end
 
-    def process_agent_response(response:)
-      if response.state != :PENDING
-        @build_state.trigger(response.state)
-      else
-        case @build_state.state
-        when :REJECTED
-          # Agent is busy. How do we handle this?
-          emit_error_response(response.error)
-        when :RUNNING
-          emit_new_row(
-            type: response.log.level,
-            message: response.log.message,
-            time: Time.now
-          )
-        when :FINISHING
-          artifact_path = File.join(@artifacts_path, response.artifact.filename)
-          artifact = current_build.artifacts.find { |a| a.reference == artifact_path }
-          unless artifact
-            current_build.artifacts << Artifact.new(
-              type: response.artifact.filename,
-              reference: artifact_path,
-              provider: @project.artifact_provider
-            )
-          end
-          File.open(artifact_path, "a") { |f| f.write(response.artifact.chunk) }
-        when :BROKEN
-          emit_error_response(response.error)
-        end
-      end
+    def handle_error(error)
+      logger.debug("handle error: #{error}")
+      publish_to_all(error: error.to_h)
     end
 
-    # Handle a new incoming row (log), and alert every stakeholder who is interested
-    def emit_new_row(type:, message:, time:)
-      logger.debug(message) unless message.to_s.empty?
+    # handle artifact upload. Do not publish this to the subscribers.
+    def handle_artifact(artifact)
+      logger.debug("handle artifact: #{artifact.filename}")
 
-      row = BuildRunnerOutputRow.new(type: type, message: message, time: time)
-
-      # Report back the row
-      # 1)Store in the history of logs for this RemoteRunner (used to access half-built builds)
-      all_build_output_log_rows << row
-
-      # 2) Report back to all listeners, usually socket connections
-      build_change_observer_blocks.each do |block|
-        block.row_received(row)
+      artifact_path = File.join(@artifacts_path, response.artifact.filename)
+      artifact = current_build.artifacts.find { |a| a.reference == artifact_path }
+      unless artifact
+        current_build.artifacts << Artifact.new(
+          type: response.artifact.filename,
+          reference: artifact_path,
+          provider: @project.artifact_provider
+        )
       end
 
-      # 3) update the fastlane.log artifact
-      # TODO: respect the type of the log.
-      @fastlane_log.debug(message)
+      # open (or create if it doesn't exist) the file for appending with binary data.
+      File.open(artifact_path, "ab+") { |f| f.write(response.artifact.chunk) }
     end
 
-    def emit_error_response(error)
-      error_message = error.description.to_s
-      unless error.file.to_s.empty?
-        error_message += "\n#{error.file}"
-        error_message += " #{error.line_number}" if error.line_number
+    # subscribe will all send all historic data to the subscriber.
+    # the yielded object will be an InvocationResponse object
+    def subscribe(&block)
+      logger.debug("subscribing listener to topic `#{topic_name}`")
+      subscriber = FastlaneCI::Notifications.subscribe(topic_name, &block)
+
+      replay_history_to(subscriber)
+
+      # make sure we call completion blocks if a subscriber joins after we have completed.
+      if completed?
+        @completion_blocks.each(&:call)
       end
-      error_message += "\n#{error.stacktrace}" unless error.stacktrace.to_s.empty?
-      error_message += "\nExitCode: #{error.exit_status}" if error.exit_status
-      error_message.split("\n").each do |message|
-        emit_new_row(type: :ERROR, message: message, time: Time.now)
+
+      return subscriber
+    end
+
+    def unsubscribe(subscriber)
+      logger.debug("unsubscribing listener #{subscriber}")
+      FastlaneCI::Notifications.unsubscribe(subscriber)
+    end
+
+    def topic_name
+      ["remote_runner", project.id, current_build.number].join(".")
+    end
+
+    private
+
+    def publish_to(subscriber, payload)
+      notifier = FastlaneCI::Notifications.notifier
+      notifier.publish(subscriber: subscriber, payload: payload)
+    end
+
+    def publish_to_all(payload)
+      @history << payload
+      notifier = FastlaneCI::Notifications.notifier
+      notifier.publish(name: topic_name, payload: payload)
+    end
+
+    def replay_history_to(subscriber)
+      @history.each do |payload|
+        publish_to(subscriber, payload)
       end
     end
 
+    # TODO(snatchev): move this into the service
     def prepare_build_object(trigger:)
-      # TODO: move this into the service
       builds = Services.build_service.list_builds(project: project)
 
       if builds.count > 0
@@ -215,6 +209,7 @@ module FastlaneCI
       )
     end
 
+    # TODO(snatchev): pull this into it's own class for more testability.
     def environment_variables_for_worker
       # Set the CI specific Environment variables first
 
@@ -278,6 +273,9 @@ module FastlaneCI
 
     # Responsible for updating the build status in our local config
     # and on GitHub
+    #
+    # TODO:(snatchev) this operation must be *Synchronous*
+    # because we don't want to send a message to the subscribers before it's been persisted
     def save_build_status!
       # TODO: update so that we can strip out the SHAs that should never be attempted to be rebuilt
       save_build_status_locally!

@@ -2,12 +2,13 @@ require_relative "api_controller"
 require_relative "./view_models/build_summary_view_model"
 require_relative "./view_models/build_view_model"
 
+require "faye/websocket"
+Faye::WebSocket.load_adapter("thin")
+
 module FastlaneCI
   # Controller for providing all data relating to builds
   class BuildJSONController < APIController
     HOME = "/data/projects/:project_id/build"
-
-    use(FastlaneCI::BuildWebsocketBackend)
 
     get "#{HOME}/:build_number" do |project_id, build_number|
       build_view_model = BuildViewModel.new(build: current_build)
@@ -107,6 +108,50 @@ module FastlaneCI
       end
 
       return json(log_array)
+    end
+
+    get "#{HOME}/:build_number/log.ws", authenticate: false do |project_id, build_number|
+      halt(415, "unsupported media type") unless Faye::WebSocket.websocket?(request.env)
+      ws = Faye::WebSocket.new(request.env, nil, { ping: 30 })
+
+      ws.on(:open) do |event|
+        logger.debug([:open, ws.object_id])
+
+        current_build_runner = Services.build_runner_service.find_build_runner(
+          project_id: project_id,
+          build_number: build_number.to_i
+        )
+
+        if current_build_runner.nil?
+          ws.close(1000, "no runner found for project #{project_id} and build #{build_number}.")
+          next
+        end
+
+        # subscribe the current socket to events from the remote_runner
+        # as soon as a subscriber is returned, they will receive all historical items as well.
+        @subscriber = current_build_runner.subscribe do |_topic, payload|
+          ws.send(JSON.dump(payload))
+        end
+
+        current_build_runner.on_complete do
+          ws.close(1000, "runner complete.")
+        end
+      end
+
+      ws.on(:close) do |event|
+        logger.debug([:close, ws.object_id, event.code, event.reason])
+
+        current_build_runner = Services.build_runner_service.find_build_runner(
+          project_id: project_id,
+          build_number: build_number.to_i
+        )
+        next if current_build_runner.nil?
+
+        current_build_runner.unsubscribe(@subscriber)
+      end
+
+      # Return async Rack response
+      return ws.rack_response
     end
 
     def current_build

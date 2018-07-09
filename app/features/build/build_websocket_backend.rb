@@ -15,14 +15,9 @@ module FastlaneCI
 
     KEEPALIVE_TIME = 30 # in seconds
 
-    # A hash of connected web sockets, the key being the project ID, and then the build number
-    attr_accessor :websocket_clients
-
     def initialize(app)
       logger.debug("Setting up new BuildWebsocketBackend")
       @app = app
-
-      self.websocket_clients = {}
     end
 
     def call(env)
@@ -33,7 +28,6 @@ module FastlaneCI
       end
 
       ws = Faye::WebSocket.new(env, nil, { ping: KEEPALIVE_TIME })
-      web_socket_build_runner_change_listener = WebSocketBuildRunnerChangeListener.new(web_socket: ws)
 
       ws.on(:open) do |event|
         logger.debug([:open, ws.object_id])
@@ -42,19 +36,18 @@ module FastlaneCI
         build_number = request_params["build_number"].to_i
         project_id = request_params["project_id"]
 
-        websocket_clients[project_id] ||= {}
-        websocket_clients[project_id][build_number] ||= []
-        websocket_clients[project_id][build_number] << ws
-
         current_build_runner = Services.build_runner_service.find_build_runner(
           project_id: project_id,
           build_number: build_number
         )
         next if current_build_runner.nil? # this is the case if the build was run a while ago
 
-        # TODO: Think this through, do we properly add new listener, and notify them of line changes, etc.
-        #       Also how does the "offboarding" of runners work once the tests are finished
-        current_build_runner.add_build_change_listener(web_socket_build_runner_change_listener)
+        # subscribe the current socket to events from the remote_runner
+        # as soon as a subscriber is returned, they will receive all historical items as well.
+        @subscriber = current_build_runner.subscribe do |invocation_response|
+          ws.send(invocation_response)
+        end
+        logger.debug("subscribed #{@subscriber} to the project topic.")
       end
 
       ws.on(:message) do |event|
@@ -69,9 +62,13 @@ module FastlaneCI
         build_number = request_params["build_number"].to_i
         project_id = request_params["project_id"]
 
-        websocket_clients[project_id][build_number].delete(ws)
-        web_socket_build_runner_change_listener.connection_closed
-        ws = nil
+        current_build_runner = Services.build_runner_service.find_build_runner(
+          project_id: project_id,
+          build_number: build_number
+        )
+        next if current_build_runner.nil? # this is the case if the build was run a while ago
+
+        current_build_runner.unsubscribe(@subscriber)
       end
 
       # Return async Rack response
